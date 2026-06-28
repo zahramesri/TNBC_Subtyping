@@ -1,0 +1,405 @@
+# GeoMx Spatial Transcriptomics — LSU TNBC Study
+# Batches 10, 18, 19, 21
+# Batch21 = HC7 | Batch18 = HC8 | Batch19 = CC2
+# Batch10 = 722 (CC1), 250 (CC2), 391 (CC3)
+
+library(NanoStringNCTools)
+library(GeomxTools)
+library(dplyr)
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(writexl)
+library(ggplot2)
+library(patchwork)
+library(umap)
+library(scales)
+library(knitr)
+
+
+#### Load data ---------------------------------------------------------------
+
+data.dir      <- file.path("")  # path to DCC files
+DCCFiles      <- dir(data.dir, pattern = ".dcc$", full.names = TRUE, recursive = TRUE)
+PKCFiles      <- file.path("")  # path to Hs_R_NGS_WTA_v1.0.pkc
+SampletypeFile <- file.path("") # path to DCC_annotation.xlsx
+
+TNBC_data <- readNanoStringGeoMxSet(
+  dccFiles               = DCCFiles,
+  pkcFiles               = PKCFiles,
+  phenoDataFile          = SampletypeFile,
+  phenoDataDccColName    = "Sample_ID",
+  protocolDataColNames   = c("roi", "aoi"),
+  experimentDataColNames = c("panel"),
+  phenoDataSheet         = "Sheet 1"
+)
+# 18815 features, 3733 samples
+
+
+#### Merge LSU metadata ------------------------------------------------------
+
+ER_patients <- c(
+  "TNBC0055","TNBC0074","TNBC0147","TNBC0150","TNBC0160","TNBC0164","TNBC0187",
+  "TNBC0205","TNBC0218","TNBC0238","TNBC0325","TNBC0326","TNBC0347","TNBC0353",
+  "TNBC0356","TNBC0438","TNBC0459","TNBC0474","TNBC0499","TNBC0508","TNBC0536",
+  "TNBC0557","TNBC0580","TNBC0599","TNBC0613","TNBC0667","TNBC0669","TNBC0731",
+  "TNBC0793","TNBC0868","TNBC0869","TNBC0899","TNBC0909","TNBC0933","TNBC0936",
+  "TNBC1013","TNBC1066","TNBC1074"
+)
+
+lsu_meta <- as.data.frame(read_excel("data/METADATA.xlsx")) %>%
+  rename(VitalStatus = "Vital Status") %>%
+  select(Patients, Age, Race, VitalStatus, months, survival_2y, survival_5y,
+         HierarchicalCluster, ConsensusCluster, Obese)
+
+geomx_meta <- pData(TNBC_data)
+geomx_meta$DCC <- rownames(geomx_meta)
+
+# 38 patients with high ESR1 mRNA — append _NEW to match bulk RNA-seq naming
+geomx_meta$Patients[geomx_meta$Patients %in% ER_patients] <-
+  paste0(geomx_meta$Patients[geomx_meta$Patients %in% ER_patients], "_NEW")
+
+geomx_meta <- merge(geomx_meta, lsu_meta, by = "Patients", all.x = TRUE) %>%
+  column_to_rownames(var = "DCC")
+
+pData(TNBC_data) <- geomx_meta
+
+
+#### ROI filtering -----------------------------------------------------------
+
+# Batch18: exclude MS15_23827 and two ROIs from S12_18379 (007, 008) marked REMOVE
+# Batch21: exclude ROIs flagged by clinician
+
+metadata     <- pData(TNBC_data)
+rois_to_keep <- rownames(metadata)[!(
+  (!is.na(metadata$Epithelial)  & metadata$Epithelial == "REMOVE") |
+    (!is.na(metadata$Vicky.notes) & metadata$Vicky.notes %in% c("DO NOT USE","Do not use","EXCLUDE"))
+)]
+
+TNBC_data_filtered <- TNBC_data[, rois_to_keep]
+# 18815 features, 3662 samples
+
+TNBC_data <- TNBC_data_filtered
+pData(TNBC_data)$segment <- gsub("PanCk-", "PanCK-", pData(TNBC_data)$segment)
+
+rm(TNBC_data_filtered)
+gc()
+
+
+#### Shift counts + color palettes -------------------------------------------
+
+pkcs    <- annotation(TNBC_data)
+modules <- gsub(".pkc", "", pkcs)
+
+TNBC_data_shifted <- shiftCountsOne(TNBC_data, useDALogic = TRUE)
+
+pData(TNBC_data_shifted)$ROI_REL <- paste0(
+  sData(TNBC_data_shifted)$`slide name`, ".",
+  sData(TNBC_data_shifted)$roi, ".",
+  sData(TNBC_data_shifted)$Region, ".",
+  sData(TNBC_data_shifted)$Epithelial, ".",
+  sData(TNBC_data_shifted)$ImmuneCellLocalization
+)
+pData(TNBC_data_shifted)$ROI_REL_seg <- paste0(
+  pData(TNBC_data_shifted)$ROI_REL, ".",
+  pData(TNBC_data_shifted)$segment
+)
+
+cc_colors <- c(CC1 = "#64A79A", CC2 = "#B7C7B8", CC3 = "#E0F2E6")
+hc_colors <- c(HC1 = "#005089", HC2 = "#ADCCF6", HC3 = "#008BAC",
+               HC4 = "#645A9F", HC5 = "#DEBDEF", HC6 = "#AE8FD1",
+               HC7 = "#67223F", HC8 = "#E494AF", HC9 = "#963B8A")
+
+segment_colors <- c("PanCK-" = "#604EA1", "PanCK+" = "#8DAF2A")
+
+save(file = "data/000_PreQC_TNBC_data.RData", TNBC_data, TNBC_data_shifted, pkcs, modules)
+
+#### Pre QC Plots ####----------------------------------------------------------------------------------------------
+
+pData(TNBC_data_shifted)$area <- as.numeric(pData(TNBC_data_shifted)$area)
+
+col_by <- "segment"
+
+QC_histogram <- function(assay_data, annotation, fill_by, thr, scale_trans = NULL) {
+  plt <- ggplot(assay_data, aes(x = .data[[annotation]], fill = .data[[fill_by]])) +
+    geom_histogram(bins = 50) +
+    geom_vline(xintercept = thr, lty = "dashed", color = "black") +
+    theme_bw() + guides(fill = "none") +
+    facet_wrap(as.formula(paste("~", fill_by)), nrow = 4) +
+    labs(x = annotation, y = "Segments, #", title = annotation)
+  if (!is.null(scale_trans))
+    plt <- plt + scale_x_continuous(trans = scale_trans)
+  plt
+}
+
+f1 <- QC_histogram(sData(TNBC_data_shifted), "NTC",    col_by, 1000) +
+  QC_histogram(sData(TNBC_data_shifted), "area",   col_by, 5000, "log10") +
+  QC_histogram(sData(TNBC_data_shifted), "nuclei", col_by, 100)
+
+f2 <- QC_histogram(sData(TNBC_data_shifted), "Raw",      col_by, 1000) +
+  QC_histogram(sData(TNBC_data_shifted), "Trimmed",  col_by, 80) +
+  QC_histogram(sData(TNBC_data_shifted), "Stitched", col_by, 80) +
+  QC_histogram(sData(TNBC_data_shifted), "Aligned",  col_by, 80)
+
+#### Segment QC --------------------------------------------------------------
+metdata <- sData(TNBC_data_shifted)
+f3 <- ggplot(metdata, aes(y = log10(area), x = log10(nuclei))) +
+  geom_point() + geom_smooth(method = "lm", formula = y ~ x) +
+  labs(y = "log10(Area)", x = "log10(Nuclei)") +
+  ggplot(metdata, aes(x = Raw, y = Aligned, color = `slide name`, shape = segment)) +
+  geom_point() + stat_smooth(method = "lm", formula = y ~ x) +
+  labs(x = "Raw Reads", y = "Aligned Reads") + theme(legend.position = "none") +
+  ggplot(metdata, aes(x = DeduplicatedReads, y = Aligned, color = batch)) +
+  geom_point() + labs(x = "Deduplicated Reads", y = "Aligned Reads")
+
+QC_params <- list(
+  minSegmentReads   = 1000,
+  percentTrimmed    = 80,
+  percentStitched   = 80,
+  percentAligned    = 80,
+  percentSaturation = 50,
+  minNegativeCount  = 1,
+  maxNTCCount       = 60000,
+  minNuclei         = 40,
+  minArea           = 1000
+)
+
+TNBC_data_shifted <- setSegmentQCFlags(TNBC_data_shifted, qcCutoffs = QC_params)
+
+QCResults    <- protocolData(TNBC_data_shifted)[["QCFlags"]]
+flag_columns <- colnames(QCResults)
+QC_Summary   <- data.frame(Pass    = colSums(!QCResults[, flag_columns]),
+                           Warning = colSums( QCResults[, flag_columns]))
+QCResults$QCStatus <- apply(QCResults, 1L, function(x) ifelse(sum(x) == 0L, "PASS", "WARNING"))
+QC_Summary["TOTAL FLAGS", ] <- c(sum(QCResults$QCStatus == "PASS"),
+                                 sum(QCResults$QCStatus == "WARNING"))
+kable(QC_Summary, caption = "QC Summary Table")
+
+# negative geometric means
+negativeGeoMeans <- esBy(negativeControlSubset(TNBC_data_shifted), GROUP = "Module",
+                         FUN = function(x) assayDataApply(x, MARGIN = 2, FUN = ngeoMean, elt = "exprs"))
+
+protocolData(TNBC_data_shifted)[["NegGeoMean"]] <- negativeGeoMeans
+
+negCols <- paste0("NegGeoMean_", modules)
+pData(TNBC_data_shifted)[, negCols] <- sData(TNBC_data_shifted)[["NegGeoMean"]]
+
+for (ann in negCols) {
+  plt <- QC_histogram(pData(TNBC_data_shifted), ann, col_by, 2, "log10")
+}
+
+pData(TNBC_data_shifted) <- pData(TNBC_data_shifted)[,
+                                                     !colnames(pData(TNBC_data_shifted)) %in% negCols]
+
+TNBC_data_pass <- TNBC_data_shifted[, QCResults$QCStatus == "PASS"]
+TNBC_data_fail <- TNBC_data_shifted[, QCResults$QCStatus == "WARNING"]
+
+qc_info          <- sData(TNBC_data_fail)$QCFlags
+qc_info$ROI_REL  <- sData(TNBC_data_fail)$ROI_REL
+qc_info$QCFAILED <- "YES"
+
+metdata_pass <- sData(TNBC_data_pass)
+f4 <- ggplot(metdata_pass, aes(y = log10(area), x = log10(nuclei), color = `slide name`)) +
+  geom_point() + labs(y = "log10(Area)", x = "log10(Nuclei)") +
+  ggplot(metdata_pass, aes(x = Raw, y = Aligned, color = `slide name`)) +
+  geom_point() + labs(x = "Raw Reads", y = "Aligned Reads") +
+  ggplot(metdata_pass, aes(x = DeduplicatedReads, y = Aligned, color = batch)) +
+  geom_point() + labs(x = "Deduplicated Reads", y = "Aligned Reads") +
+  ggplot(metdata_pass, aes(x = as.numeric(unlist(`Saturated (%)`)), y = Raw, color = batch)) +
+  geom_point() + labs(x = "Sequencing Saturation %", y = "Raw Reads")
+
+#### Probe QC ----------------------------------------------------------------
+
+TNBC_data_pass <- setBioProbeQCFlags(TNBC_data_pass,
+                                     qcCutoffs = list(minProbeRatio = 0.1, percentFailGrubbs = 20),
+                                     removeLocalOutliers = FALSE)
+
+ProbeQCResults <- fData(TNBC_data_pass)[["QCFlags"]]
+kable(data.frame(
+  Passed = sum(rowSums(ProbeQCResults[, -1]) == 0),
+  Global = sum(ProbeQCResults$GlobalGrubbsOutlier),
+  Local  = sum(rowSums(ProbeQCResults[, -2:-1]) > 0 & !ProbeQCResults$GlobalGrubbsOutlier)
+), caption = "Probes flagged or passed as outliers")
+
+TNBC_passed_QC <- subset(TNBC_data_pass,
+                         fData(TNBC_data_pass)[["QCFlags"]][, "LowProbeRatio"]       == FALSE &
+                           fData(TNBC_data_pass)[["QCFlags"]][, "GlobalGrubbsOutlier"] == FALSE)
+# 18815 features, 3481 samples
+
+save(file = "data/1_TNBC_PostQC.RData", TNBC_passed_QC) #This is available on GEO
+
+
+#### Gene-level aggregation --------------------------------------------------
+
+TNBC_targets <- aggregateCounts(TNBC_passed_QC)
+# 18677 features, 3481 samples
+
+save(file = "data/2_TargetLevelCounts_TNBC.RData", TNBC_targets)
+
+
+#### LOQ and segment filtering -----------------------------------------------
+
+cutoff <- 2
+minLOQ <- 2
+
+LOQ <- data.frame(row.names = colnames(TNBC_targets))
+for (module in modules) {
+  vars <- paste0(c("NegGeoMean_","NegGeoSD_"), module)
+  if (all(vars %in% colnames(pData(TNBC_targets)))) {
+    LOQ[, module] <- pmax(minLOQ,
+                          pData(TNBC_targets)[, vars[1]] * pData(TNBC_targets)[, vars[2]] ^ cutoff)
+  }
+}
+pData(TNBC_targets)$LOQ <- LOQ
+
+LOQ_Mat <- c()
+for (module in modules) {
+  ind   <- fData(TNBC_targets)$Module == module
+  Mat_i <- t(esApply(TNBC_targets[ind, ], MARGIN = 1, FUN = function(x) x > LOQ[, module]))
+  LOQ_Mat <- rbind(LOQ_Mat, Mat_i)
+}
+LOQ_Mat <- LOQ_Mat[fData(TNBC_targets)$TargetName, ]
+
+pData(TNBC_targets)$GenesDetected     <- colSums(LOQ_Mat, na.rm = TRUE)
+pData(TNBC_targets)$GeneDetectionRate <- pData(TNBC_targets)$GenesDetected / nrow(TNBC_targets)
+pData(TNBC_targets)$DetectionThreshold <- cut(
+  pData(TNBC_targets)$GeneDetectionRate,
+  breaks = c(0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.15, 1),
+  labels = c("<1%","1-2%","2-3%","3-4%","4-5%","5-10%","10-15%",">15%")
+)
+
+f5 <- ggplot(pData(TNBC_targets),
+             aes(x = as.numeric(unlist(LOQ)), y = GenesDetected,
+                 color = `slide name`, shape = segment)) +
+  geom_point() + labs(x = "LOQ", y = "Genes Detected")
+
+f6 <- ggplot(pData(TNBC_targets), aes(x = DetectionThreshold)) +
+  geom_bar(aes(fill = `slide name`)) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  theme_bw() + scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "Gene Detection Rate", y = "Segments, #", fill = "Sample Name")
+
+f7 <- ggplot(pData(TNBC_targets), aes(x = DetectionThreshold)) +
+  geom_bar(aes(fill = segment)) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  scale_fill_manual(values = segment_colors) +
+  theme_bw() + scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "Gene Detection Rate", y = "Segments, #", fill = "Segment")
+
+f8 <- ggplot(pData(TNBC_targets), aes(x = DetectionThreshold)) +
+  geom_bar(aes(fill = ConsensusCluster)) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  scale_fill_manual(values = cc_colors) +
+  theme_bw() + scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "Gene Detection Rate", y = "Segments, #", fill = "CC Subtype")
+
+save(file = "data/03_Targets_PriorToFiltering_TNBC.RData", TNBC_targets, LOQ)
+
+# keep segments with >= 5% gene detection rate
+TNBC_targets_sf <- TNBC_targets[, pData(TNBC_targets)$GeneDetectionRate >= 0.05]
+# 18677 features, 2825 samples
+
+LOQ_Mat <- LOQ_Mat[, colnames(TNBC_targets_sf)]
+fData(TNBC_targets_sf)$DetectedSegments <- rowSums(LOQ_Mat, na.rm = TRUE)
+fData(TNBC_targets_sf)$DetectionRate    <- fData(TNBC_targets_sf)$DetectedSegments /
+  nrow(pData(TNBC_targets_sf))
+
+
+#### Gene filtering ----------------------------------------------------------
+
+plot_detect        <- data.frame(Freq = c(1, 5, 10, 20, 30, 50))
+plot_detect$Number <- unlist(lapply(c(0.01, 0.05, 0.1, 0.2, 0.3, 0.5),
+                                    function(x) sum(fData(TNBC_targets_sf)$DetectionRate >= x)))
+plot_detect$Rate   <- plot_detect$Number / nrow(fData(TNBC_targets_sf))
+
+f8.1 <- ggplot(plot_detect, aes(x = as.factor(Freq), y = Rate, fill = Rate)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = formatC(Number, format = "d", big.mark = ",")),
+            vjust = 1.6, color = "black", size = 4) +
+  scale_fill_gradient2(low = "orange2", mid = "lightblue", high = "dodgerblue3",
+                       midpoint = 0.65, limits = c(0,1), labels = percent) +
+  theme_bw() +
+  scale_y_continuous(labels = percent, limits = c(0,1),
+                     expand = expansion(mult = c(0, 0))) +
+  labs(x = "% of Segments", y = "Genes Detected, % of Panel > LOQ")
+
+neg_probes  <- unique(subset(fData(TNBC_targets_sf), CodeClass == "Negative")$TargetName)
+
+target_GF_5  <- TNBC_targets_sf[fData(TNBC_targets_sf)$DetectionRate >= 0.05 |
+                                  fData(TNBC_targets_sf)$TargetName %in% neg_probes, ]
+target_GF_10 <- TNBC_targets_sf[fData(TNBC_targets_sf)$DetectionRate >= 0.10 |
+                                  fData(TNBC_targets_sf)$TargetName %in% neg_probes, ]
+# target_GF_5:  9583 features, 2825 samples
+# target_GF_10: 7551 features, 2825 samples
+save(file = "data/04_PostGeneDetection_GF5_GF10_TNBC.RData", target_GF_5, target_GF_10)
+
+
+#### UMAP before normalization -----------------------------------------------
+
+assayDataElement(target_GF_5, elt = "exprs_log") <-
+  assayDataApply(target_GF_5, 2, FUN = log, base = 2, elt = "exprs")
+
+custom_umap              <- umap::umap.defaults
+custom_umap$n_epochs     <- 500
+custom_umap$random_state <- 42
+
+umap_pre <- umap(t(assayDataElement(target_GF_5, elt = "exprs_log")), config = custom_umap)
+pData(target_GF_5)[, c("UMAP1","UMAP2")] <- umap_pre$layout
+
+ggplot(pData(target_GF_5), aes(x = UMAP1, y = UMAP2, color = HierarchicalCluster)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = hc_colors) +
+  ggtitle("UMAP before normalization (5% cutoff)") +
+  theme_bw()
+
+
+
+#### Q3 normalization --------------------------------------------------------
+
+TNBC_downstream <- GeomxTools::normalize(target_GF_5, norm_method = "quant",
+                                         desiredQuantile = 0.75, toElt = "q_norm")
+
+assayDataElement(TNBC_downstream, elt = "log_q") <-
+  assayDataApply(TNBC_downstream, 2, FUN = log, base = 2, elt = "q_norm")
+
+# flag patients run across multiple batches
+repeated_patients <- c("TNBC0161","TNBC0188","TNBC0320","TNBC0441","TNBC0610",
+                       "TNBC0714","TNBC0760","TNBC0925","TNBC1008","TNBC1060")
+
+norm_meta      <- as.data.frame(pData(TNBC_downstream))
+norm_meta$DCC  <- rownames(norm_meta)
+norm_meta <- merge(norm_meta,
+                   data.frame(Patients = repeated_patients, Repeated = "YES"),
+                   by = "Patients", all.x = TRUE)
+norm_meta$Repeated[is.na(norm_meta$Repeated)] <- "NO"
+norm_meta <- column_to_rownames(norm_meta, var = "DCC")
+
+norm_meta$DEA_CC1 <- ifelse(norm_meta$ConsensusCluster == "CC1", "CC1", "CC")
+norm_meta$DEA_CC2 <- ifelse(norm_meta$ConsensusCluster == "CC2", "CC2", "CC")
+norm_meta$DEA_CC3 <- ifelse(norm_meta$ConsensusCluster == "CC3", "CC3", "CC")
+norm_meta$I_NI    <- ifelse(norm_meta$Epithelial == "I", "I", "NI")
+
+pData(TNBC_downstream) <- norm_meta
+
+save(file = "data/05_TNBC_downstream_GF5.RData", TNBC_downstream)
+
+
+#### UMAP after normalization ------------------------------------------------
+
+custom_umap$n_epochs <- 500
+umap_post <- umap(t(log2(assayDataElement(TNBC_downstream, elt = "q_norm"))),
+                  config = custom_umap)
+pData(TNBC_downstream)[, c("UMAP1","UMAP2")] <- umap_post$layout
+
+ggplot(pData(TNBC_downstream), aes(x = UMAP1, y = UMAP2, color = HierarchicalCluster)) +
+  geom_point(size = 1) +
+  scale_color_manual(values = hc_colors) +
+  ggtitle("UMAP after Q3 normalization") +
+  theme_bw()
+
+
+#### Split by segment --------------------------------------------------------
+
+TNBC_downstream_PanNeg <- TNBC_downstream[, pData(TNBC_downstream)$segment == "PanCK-"]
+TNBC_downstream_PanPos <- TNBC_downstream[, pData(TNBC_downstream)$segment == "PanCK+"]
+# PanCK-: 9583 x 1366 | PanCK+: 9583 x 1459
