@@ -1,0 +1,352 @@
+# Bulk RNA-seq — LSU TNBC Study
+# GEO accession GSE268851 (https://www.ncbi.nlm.nih.gov/geo/)
+
+# Run once:
+# install.packages("BiocManager")
+# BiocManager::install(c("DESeq2", "ConsensusClusterPlus"))
+
+library(readxl)
+library(dplyr)
+library(tidyverse)
+library(DESeq2)
+library(ConsensusClusterPlus)
+library(pheatmap)
+library(grid)
+library(openxlsx)
+
+#### Load data ---------------------------------------------------------------
+
+counts <- as.data.frame(read_excel("data/GSE268851_TNBC_Study_RawCounts.xlsx"))
+counts <- column_to_rownames(counts, var = colnames(counts)[1])
+
+coldata <- as.data.frame(read_excel("data/METADATA.xlsx")) |>
+  column_to_rownames(var = "Patients")
+
+
+#### Sample QC ---------------------------------------------------------------
+
+# TNBC0460: outlier; TNBC0632: misdiagnosed
+counts <- counts[, !colnames(counts) %in% c("TNBC0460", "TNBC0632")]
+counts <- counts[, rownames(coldata)]
+
+# 38 samples had high ESR1 mRNA — renamed with _NEW suffix for downstream use
+id_map <- c(
+  TNBC0074 = "TNBC0074_NEW", TNBC0147 = "TNBC0147_NEW", TNBC0150 = "TNBC0150_NEW",
+  TNBC0218 = "TNBC0218_NEW", TNBC0325 = "TNBC0325_NEW", TNBC0347 = "TNBC0347_NEW",
+  TNBC0353 = "TNBC0353_NEW", TNBC0459 = "TNBC0459_NEW", TNBC0731 = "TNBC0731_NEW",
+  TNBC1066 = "TNBC1066_NEW", TNBC0160 = "TNBC0160_NEW", TNBC0356 = "TNBC0356_NEW",
+  TNBC0557 = "TNBC0557_NEW", TNBC0599 = "TNBC0599_NEW", TNBC0613 = "TNBC0613_NEW",
+  TNBC0667 = "TNBC0667_NEW", TNBC0899 = "TNBC0899_NEW", TNBC0936 = "TNBC0936_NEW",
+  TNBC1013 = "TNBC1013_NEW", TNBC0055 = "TNBC0055_NEW", TNBC0164 = "TNBC0164_NEW",
+  TNBC0187 = "TNBC0187_NEW", TNBC0238 = "TNBC0238_NEW", TNBC0326 = "TNBC0326_NEW",
+  TNBC0438 = "TNBC0438_NEW", TNBC0474 = "TNBC0474_NEW", TNBC0499 = "TNBC0499_NEW",
+  TNBC0508 = "TNBC0508_NEW", TNBC0580 = "TNBC0580_NEW", TNBC0669 = "TNBC0669_NEW",
+  TNBC0868 = "TNBC0868_NEW", TNBC0869 = "TNBC0869_NEW", TNBC0909 = "TNBC0909_NEW",
+  TNBC1074 = "TNBC1074_NEW", TNBC0205 = "TNBC0205_NEW", TNBC0536 = "TNBC0536_NEW",
+  TNBC0933 = "TNBC0933_NEW", TNBC0793 = "TNBC0793_NEW"
+)
+counts <- rename(counts, any_of(id_map))
+
+
+#### DEA ---------------------------------------------------------------------
+
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = coldata, design = ~Race)
+dds <- dds[rowSums(fpm(dds, robust = TRUE) > 1) >= 2]
+dds <- DESeq(dds)
+vsd <- vst(dds, blind = FALSE)
+
+plotPCA(vsd, intgroup = "Race")
+
+zscore <- as.data.frame(t(scale(t(assay(vsd)), center = TRUE, scale = TRUE)))
+zscore_filtered <- zscore[rowSums(zscore >= 2) > 0 & rowSums(zscore <= -2) > 0, ]
+
+vsd_counts <- assay(vsd)
+
+
+#### Consensus clustering ----------------------------------------------------
+
+cell_markers <- as.data.frame(read_excel("data/Cell_type_Marker.xlsx")) # Supplementary Table 1
+marker_zscore <- zscore_filtered[rownames(zscore_filtered) %in% cell_markers$gene, ]
+
+results <- ConsensusClusterPlus(
+  as.matrix(marker_zscore),
+  maxK = 20, reps = 1000, pItem = 0.8, pFeature = 1,
+  title = "output/ConsensusCluster",
+  clusterAlg = "hc", distance = "spearman",
+  seed = 1262118388.71279, plot = "png"
+)
+
+
+#### Cell-type marker heatmap ------------------------------------------------
+
+my_color <- colorRampPalette(c("blue", "white", "red"))(100)
+
+marker_expr <- na.omit(vsd_counts[match(cell_markers$gene, rownames(vsd_counts)), ])
+
+cc_colors <- c(CC1 = "#64A79A", CC2 = "#B7C7B8", CC3 = "#E0F2E6")
+hc_colors <- c(HC1 = "#005089", HC2 = "#ADCCF6", HC3 = "#008BAC",
+               HC4 = "#645A9F", HC5 = "#DEBDEF", HC6 = "#AE8FD1",
+               HC7 = "#67223F", HC8 = "#E494AF", HC9 = "#963B8A")
+
+coldata <- coldata[order(coldata$CC), ]
+coldata <- coldata[order(coldata$HC), ]
+
+hc_gaps <- cumsum(c(32, 7, 41, 42, 25, 21, 46, 29, 7))
+
+ph <- pheatmap(
+  as.matrix(marker_expr[, rownames(coldata)]),
+  scale = "row", color = my_color,
+  annotation_col = coldata[, c(16, 17), drop = FALSE],
+  annotation_colors = list(HC = hc_colors, CC = cc_colors),
+  cluster_rows = TRUE, cluster_cols = FALSE,
+  show_rownames = FALSE, show_colnames = FALSE,
+  treeheight_row = 0, treeheight_col = 0,
+  fontsize = 14, border_color = NA,
+  legend = TRUE, annotation_legend = TRUE,
+  legend_breaks = c(-4, 0, 4), gaps_col = hc_gaps
+)
+
+png("output/CellMarkersClustering.png", width = 10, height = 8, units = "in", res = 300)
+print(ph)
+dev.off()
+
+# legend saved separately for figure assembly
+legend_grob <- ph$gtable$grobs[[which(ph$gtable$layout$name == "annotation_legend")]]
+png("output/CellMarkersClustering_LEGEND.png", width = 8, height = 10, units = "in", res = 600)
+grid.draw(legend_grob)
+dev.off()
+
+#### Biomarker selection -----------------------------------------------------
+
+# per-sample mean and SD across all z-score genes
+sample_stats <- data.frame(
+  mean = sapply(zscore, mean),
+  SD   = sapply(zscore, sd)
+)
+
+write.xlsx(as.data.frame(sample_stats), rowNames = TRUE,
+           file = "output/Mean_SD_celltype_markers.xlsx")
+
+# for each CC subtype, flag genes in the top 20th percentile (pnorm >= 0.80)
+# in >= 50% of samples, using per-sample mean/SD as the null distribution
+cc_names  <- c("CC1", "CC2", "CC3")
+
+biomarkers <- lapply(cc_names, function(cc) {
+  cc_samples <- rownames(coldata[coldata$CC == cc, ])
+  zscore_cc  <- marker_zscore[, cc_samples]
+  stats_cc   <- sample_stats[cc_samples, ]
+  
+  pnorm_mat <- mapply(function(s) {
+    pnorm(zscore_cc[, s], mean = stats_cc[s, "mean"], sd = stats_cc[s, "SD"])
+  }, cc_samples)
+  rownames(pnorm_mat) <- rownames(zscore_cc)
+  
+  keep <- rowSums(pnorm_mat >= 0.80) >= round(ncol(pnorm_mat) / 2)
+  rownames(zscore_cc)[keep]
+})
+names(biomarkers) <- cc_names
+
+sink("output/Biomarkers_top20percentile_perCC.txt")
+print(biomarkers)
+sink()
+###############################################################################
+# Supplement Figure 1
+###############################################################################
+
+# Lehmann subtyping: https://www.vumc.org/pietenpol-lab/tools
+# 38 patients excluded due to high ESR1 mRNA -> annotated as "TNBCtype-excluded"
+
+#### Lehmann heatmap ---------------------------------------------------------
+
+lehmann_sheets <- c("BL1", "BL2", "M", "IM", "MSL", "LAR")
+lehmann_superset <- lapply(lehmann_sheets, function(s) {
+  as.data.frame(read_excel("data/Lehmann_DEGs.xls", sheet = s)) # from original paper
+}) |> bind_rows()
+
+lehmann_zscore <- na.omit(zscore_filtered[match(lehmann_superset$GENE, rownames(zscore_filtered)), ])
+lehmann_expr   <- na.omit(vsd_counts[match(rownames(lehmann_zscore), rownames(vsd_counts)), ])
+
+tnbctype_colors <- hcl.colors(palette = "Lajolla", n = 8)
+names(tnbctype_colors) <- c("BL1", "BL2", "TNBCtype-excluded", "IM", "LAR", "M", "MSL", "UNC")
+
+ph_lehmann <- pheatmap(
+  as.matrix(lehmann_expr),
+  scale = "row", color = my_color,
+  annotation_col = coldata[, 18, drop = FALSE],
+  annotation_colors = list(TNBCtype = tnbctype_colors),
+  cluster_rows = TRUE, cluster_cols = TRUE,
+  show_rownames = FALSE, show_colnames = FALSE,
+  fontsize = 11, treeheight_row = 0, treeheight_col = 0,
+  clustering_distance_cols = as.dist(1 - cor(lehmann_expr, method = "spearman"))
+)
+
+png("output/Lehmann_TNBCtype.png", res = 300, width = 7, height = 4.5, units = "in")
+print(ph_lehmann)
+dev.off()
+
+
+#### Race distribution -------------------------------------------------------
+
+compute_CC_significance <- function(df, target_var) {
+  target_var <- rlang::ensym(target_var)
+  
+  counts_wide <- df %>%
+    group_by(CC, !!target_var) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    pivot_wider(names_from = !!target_var, values_from = n, values_fill = 0)
+  
+  cat_cols    <- names(counts_wide)[-1]
+  n_cat       <- length(cat_cols)
+  global_dist <- prop.table(table(df %>% pull(!!target_var)))
+  
+  counts_wide %>%
+    rowwise() %>%
+    mutate(
+      observed = list(c(across(all_of(cat_cols)))),
+      expected = list(as.numeric(global_dist) * sum(unlist(observed))),
+      p_value = if (n_cat == 2) {
+        binom.test(unlist(observed)[2], sum(unlist(observed)), p = 0.5)$p.value
+      } else {
+        chisq.test(x = unlist(observed), p = as.numeric(global_dist))$p.value
+      },
+      signif = case_when(
+        p_value < 0.001 ~ "***",
+        p_value < 0.01  ~ "**",
+        p_value < 0.05  ~ "*",
+        TRUE ~ "ns"
+      )
+    ) %>%
+    ungroup()
+}
+
+plot_CC_distribution <- function(results_table, title = NULL, palette = NULL) {
+  cat_cols <- names(results_table)[!names(results_table) %in%
+                                     c("CC", "signif", "p_value", "observed", "expected")]
+  
+  df_long <- results_table %>%
+    select(CC, all_of(cat_cols)) %>%
+    pivot_longer(cols = all_of(cat_cols), names_to = "Category", values_to = "Count")
+  
+  star_pos <- results_table %>%
+    mutate(max_y = rowSums(across(all_of(cat_cols))),
+           y_pos = max_y + max(max_y) * 0.08) %>%
+    select(CC, signif, y_pos)
+  
+  if (is.null(palette)) palette <- scales::hue_pal()(length(cat_cols))
+  
+  ggplot(df_long, aes(x = CC, y = Count, fill = Category)) +
+    geom_bar(stat = "identity") +
+    geom_text(data = star_pos, aes(x = CC, y = y_pos, label = signif),
+              inherit.aes = FALSE, size = 4, fontface = "bold") +
+    scale_fill_manual(values = palette) +
+    labs(title = title, x = "TNBC Subtype (CC)", y = "Number of Patients", fill = NULL) +
+    theme_bw(base_size = 14) +
+    theme(plot.title = element_text(face = "bold", size = 14),
+          legend.position = "right")
+}
+
+df_race_SRR <- data.frame(
+  Race = rep(c("Black", "White"), each = 3),
+  CC   = rep(c("CC1", "CC2", "CC3"), times = 2),
+  Freq = c(41, 47, 39, 44, 32, 47)
+) %>%
+  tidyr::uncount(Freq) %>%
+  mutate(Race = factor(Race), CC = factor(CC, levels = c("CC1","CC2","CC3")))
+
+df_race_AR <- data.frame(
+  Row  = c("CC1_Black","CC1_White","CC2_Black","CC2_White","CC3_Black","CC3_White"),
+  Freq = c(41, 34, 38, 28, 29, 32)
+) %>%
+  separate(Row, into = c("CC","Race"), sep = "_") %>%
+  tidyr::uncount(Freq) %>%
+  mutate(Race = factor(Race), CC = factor(CC, levels = c("CC1","CC2","CC3")))
+
+race_palette <- c(Black = "black", White = "grey70")
+
+SRR_results <- compute_CC_significance(df_race_SRR, Race)
+AR_results  <- compute_CC_significance(df_race_AR,  Race)
+
+png("output/Subtype_SRR_distribution.png", res = 300, width = 4, height = 3, units = "in")
+print(plot_CC_distribution(SRR_results, title = "Self-Report", palette = race_palette))
+dev.off()
+
+png("output/Subtype_AR_distribution.png", res = 300, width = 4, height = 3, units = "in")
+print(plot_CC_distribution(AR_results, title = "Ancestry Report", palette = race_palette))
+dev.off()
+
+
+#### Stage / obesity / age ---------------------------------------------------
+
+coldata$Obese <- factor(trimws(as.character(coldata$Obese)), levels = c("Lean","Obese"))
+coldata$Age   <- as.numeric(coldata$Age)
+coldata <- coldata %>%
+  mutate(AgeBin = cut(Age, breaks = c(0, 40, 50, 60, 70, Inf),
+                      labels = c("<40","40-49","50-59","60-69","70+"), right = FALSE))
+
+png("output/Subtype_Stage_distribution.png", res = 300, width = 4, height = 3, units = "in")
+print(plot_CC_distribution(compute_CC_significance(coldata, Stage),
+                           title = "Stage", palette = RColorBrewer::brewer.pal(4, "Blues")))
+dev.off()
+
+png("output/Subtype_Obesity_distribution.png", res = 300, width = 4, height = 3, units = "in")
+print(plot_CC_distribution(compute_CC_significance(coldata, Obese),
+                           title = "Lean vs Obese", palette = c("grey30","grey70")))
+dev.off()
+
+png("output/Subtype_Age_distribution.png", res = 300, width = 4, height = 3, units = "in")
+print(plot_CC_distribution(compute_CC_significance(coldata, AgeBin),
+                           title = "Age", palette = RColorBrewer::brewer.pal(5, "Oranges")))
+dev.off()
+
+
+#### Cell deconvolution — EPIC -----------------------------------------------
+# EPIC and xCell run per package defaults; no custom code
+
+library(ggpubr)
+
+cell_types <- c("Bcells","CD4_Tcells","CD8_Tcells","CAFs",
+                "Endothelial","Macrophages","NKcells","otherCells")
+
+epic <- as.data.frame(read_excel("data/EPIC.xlsx", sheet = "cellFractions")) %>%
+  rename(Patients = 1) %>%
+  select(Patients, all_of(cell_types))
+
+coldata$Patients <- rownames(coldata)
+epic_meta <- merge(epic, coldata[, c("Patients","CC","HC")], by = "Patients")
+
+epic_long <- epic_meta %>%
+  pivot_longer(cols = all_of(cell_types), names_to = "cell_type", values_to = "fraction")
+
+png("output/EPIC_distribution.png", res = 300, width = 8, height = 4.5, units = "in")
+ggplot(epic_long, aes(x = CC, y = fraction, fill = CC)) +
+  geom_boxplot(outlier.size = 0.5, width = 0.6) +
+  facet_wrap(~cell_type, scales = "free_y", nrow = 2) +
+  scale_fill_manual(values = cc_colors) +
+  labs(x = "", y = "Cell Fraction") +
+  stat_compare_means(method = "wilcox.test",
+                     comparisons = list(c("CC1","CC2"), c("CC1","CC3"), c("CC2","CC3")),
+                     label = "p.signif", hide.ns = TRUE) +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(size = 11, face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        panel.grid = element_line(linewidth = 0.3))
+dev.off()
+
+
+#### xCell heatmap -----------------------------------------------------------
+# scaled.scores: xCell enrichment scores scaled across samples
+
+coldata <- coldata[order(coldata$CC), ]
+coldata <- coldata[order(coldata$HC), ]
+
+png("output/XCELL.png", res = 300, width = 10, height = 5, units = "in")
+pheatmap(as.matrix(scaled.scores[, rownames(coldata)]),
+         scale = "row", color = my_color,
+         annotation_col = coldata[, c(16, 17)],
+         annotation_colors = list(HC = hc_colors, CC = cc_colors),
+         cluster_rows = TRUE, cluster_cols = FALSE,
+         show_rownames = TRUE, show_colnames = FALSE,
+         fontsize_row = 14, treeheight_row = 0, treeheight_col = 0,
+         border_color = NA, legend = TRUE, gaps_col = hc_gaps)
+dev.off()
