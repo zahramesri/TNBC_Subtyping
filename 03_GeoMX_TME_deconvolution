@@ -1,0 +1,297 @@
+# GeoMx — SpatialDecon, TPM conversion, and EcoTyper state assignment
+# PanCK- segments, LSU TNBC cohort — major cell types
+
+library(SpatialDecon)
+library(NanoStringNCTools)
+library(GeomxTools)
+library(org.Hs.eg.db)
+library(tidyverse)
+library(reshape2)
+library(readxl)
+library(openxlsx)
+library(gridExtra)
+
+
+#### Load all data -----------------------------------------------------------
+
+load("data/BreastCancer_ImmuneProfile_majorCellTypes.RData")  # tnbc.profile_matrix.major
+load("data/04_PostGeneDetection_GF5_GF10_TNBC.RData")        # target_GF_5
+load("data/05_TNBC_downstream_GF5.RData")                     # TNBC_downstream
+
+# normalized object — used for SpatialDecon and EcoTyper metadata
+TNBC_downstream_PanNeg <- TNBC_downstream[, rownames(pData(TNBC_downstream) %>% filter(segment == "PanCK-"))]
+TNBC_downstream_PanPos <- TNBC_downstream[, rownames(pData(TNBC_downstream) %>% filter(segment == "PanCK+"))]
+
+# raw counts — used for TPM conversion
+TNBC_GF5_PanNeg <- target_GF_5[, rownames(pData(target_GF_5) %>% filter(segment == "PanCK-"))]
+TNBC_GF5_PanPos <- target_GF_5[, rownames(pData(target_GF_5) %>% filter(segment == "PanCK+"))]
+
+counts_pos <- as.data.frame(assayDataElement(TNBC_GF5_PanPos, elt = "exprs"))
+counts_neg <- as.data.frame(assayDataElement(TNBC_GF5_PanNeg, elt = "exprs"))
+
+
+#### SpatialDecon — major cell types -----------------------------------------
+
+major_colors <- c(
+  Endothelial              = "salmon",
+  "Fibroblast/Mesenchymal" = "#FFC400",
+  PVL                      = "lightgoldenrod1",
+  "T-cells"                = "blue4",
+  Myeloid                  = "slateblue",
+  "B-cells"                = "dodgerblue",
+  Plasmablasts             = "lightskyblue1"
+)
+major_order <- names(major_colors)
+
+res_major <- runspatialdecon(
+  object        = TNBC_downstream_PanNeg,
+  norm_elt      = "q_norm",
+  raw_elt       = "exprs",
+  X             = tnbc.profile_matrix.major,
+  is_pure_tumor = NULL,
+  align_genes   = TRUE,
+  cell_counts   = TNBC_downstream_PanNeg$nuclei
+)
+
+rownames(pData(res_major)$cell.counts$cell.counts) <- TNBC_downstream_PanNeg$ROI_REL
+rownames(res_major$prop_of_all)                    <- TNBC_downstream_PanNeg$ROI_REL
+
+props_major <- t(res_major$prop_of_all)
+cells_major <- t(pData(res_major)$cell.counts$cell.counts)
+
+reordered_props_major <- props_major[match(major_order, rownames(props_major)), ]
+reordered_cells_major <- cells_major[match(major_order, rownames(cells_major)), ]
+
+nuclei_df     <- as.data.frame(TNBC_downstream_PanNeg$nuclei)
+rownames(nuclei_df) <- pData(TNBC_downstream_PanNeg)$ROI_REL
+total_cells   <- as.data.frame(rowSums(pData(res_major)$cell.counts$cell.counts))
+nuclei_totals <- reshape2::melt(cbind(nuclei_df, total_cells) %>% rownames_to_column("AOI"))
+
+save(file = "data/SpatialDecon_Major_TNBC.RData",
+     res_major, reordered_props_major, reordered_cells_major, nuclei_df, total_cells, nuclei_totals)
+
+
+#### Cell proportion histograms ----------------------------------------------
+
+geomx_meta  <- pData(TNBC_downstream_PanNeg)
+meta_slim   <- geomx_meta[, c("slide name","HierarchicalCluster","ConsensusCluster","Patients","Region")]
+meta_slim$CC_Region <- paste0(meta_slim$ConsensusCluster, "-", meta_slim$Region)
+meta_unique <- meta_slim %>% distinct(`slide name`, .keep_all = TRUE)
+
+plot_cell_histograms <- function(prop_matrix, outfile) {
+  cellnames <- rownames(prop_matrix)
+  pdf(outfile, width = 15, height = 10)
+  for (cell in cellnames) {
+    x_cells <- reshape2::melt(prop_matrix[cell, ]) %>%
+      rownames_to_column("AOI") %>%
+      mutate(`slide name` = sub("\\..*", "", AOI))
+    x_cells_meta <- merge(x_cells, meta_unique, by = "slide name") %>%
+      mutate(CC_Region = as.factor(CC_Region))
+    p <- ggplot(x_cells_meta, aes(x = value, fill = CC_Region)) +
+      geom_histogram(binwidth = 0.05, color = "grey", position = "identity") +
+      geom_vline(xintercept = c(0.25, 0.5, 0.75), linetype = "dashed") +
+      labs(title = paste("Cell proportions:", cell), x = cell, y = "Frequency") +
+      theme_minimal() + ylim(0, 75) + xlim(0, 0.75) +
+      facet_wrap(~CC_Region, scales = "free_y") +
+      theme(axis.text        = element_text(size = 12, face = "bold"),
+            axis.title       = element_text(face = "bold", size = 12),
+            panel.background = element_blank(),
+            panel.grid       = element_blank())
+    print(p)
+  }
+  dev.off()
+}
+
+plot_cell_histograms(reordered_props_major, "output/Majorcell_histograms_CC_Region.pdf")
+
+
+#### TPM conversion (for EcoTyper input) -------------------------------------
+
+get_gene_lengths <- function(gene_symbols) {
+  entrez_ids <- mapIds(org.Hs.eg.db, keys = gene_symbols,
+                       column = "ENTREZID", keytype = "SYMBOL", multiVals = "first")
+  gene_info <- select(org.Hs.eg.db, keys = entrez_ids,
+                      columns = c("CHRLOC","CHRLOCEND"), keytype = "ENTREZID") %>%
+    mutate(gene_length        = abs(CHRLOCEND - CHRLOC),
+           external_gene_name = names(entrez_ids)[match(ENTREZID, entrez_ids)]) %>%
+    na.omit()
+  gene_info[match(gene_symbols, gene_info$external_gene_name), ]
+}
+
+counts_to_tpm <- function(counts, gene_lengths) {
+  keep         <- !is.na(gene_lengths$gene_length)
+  counts_filt  <- counts[keep, ]
+  lengths_filt <- gene_lengths$gene_length[keep]
+  rpk <- counts_filt / lengths_filt
+  tpm <- t(t(rpk) * 1e6 / colSums(rpk))
+  list(tpm = tpm, log_tpm = log2(tpm))
+}
+
+gene_lengths_pos <- get_gene_lengths(rownames(counts_pos))
+gene_lengths_neg <- get_gene_lengths(rownames(counts_neg))
+
+res_tpm_pos <- counts_to_tpm(counts_pos, gene_lengths_pos)
+res_tpm_neg <- counts_to_tpm(counts_neg, gene_lengths_neg)
+
+save(file = "data/TPM_PanPos.RData", tpm = res_tpm_pos$tpm, log_tpm = res_tpm_pos$log_tpm)
+save(file = "data/TPM_PanNeg.RData", tpm = res_tpm_neg$tpm, log_tpm = res_tpm_neg$log_tpm)
+
+write_ecotyper_inputs <- function(tpm_mat, geomx_obj, tpm_file, annot_file) {
+  tpm_df   <- rownames_to_column(as.data.frame(tpm_mat), var = "Gene")
+  annot_df <- rownames_to_column(as.data.frame(pData(geomx_obj)), var = "ID")
+  annot_df$ID <- gsub("-", ".", annot_df$ID)
+  write.table(tpm_df,   file = tpm_file,   sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+  write.table(annot_df, file = annot_file, sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+}
+
+write_ecotyper_inputs(res_tpm_pos$tpm, TNBC_GF5_PanPos,
+                      "data/EcoTyper_input/TPM_PanPos.txt",
+                      "data/EcoTyper_input/annotation_PanPos.txt")
+
+write_ecotyper_inputs(res_tpm_neg$tpm, TNBC_GF5_PanNeg,
+                      "data/EcoTyper_input/TPM_PanNeg.txt",
+                      "data/EcoTyper_input/annotation_PanNeg.txt")
+
+# EcoTyper recovery (run from terminal after generating TPM files above):
+# Rscript EcoTyper_recovery_bulk.R -d Carcinoma \
+#   -m data/EcoTyper_input/TPM_PanNeg.txt \
+#   -a data/EcoTyper_input/annotation_PanNeg.txt \
+#   -o output/EcoTyper_PanNeg
+#
+# Rscript EcoTyper_recovery_bulk.R -d Carcinoma \
+#   -m data/EcoTyper_input/TPM_PanPos.txt \
+#   -a data/EcoTyper_input/annotation_PanPos.txt \
+#   -o output/EcoTyper_PanPos
+
+
+#### EcoTyper state assignment -----------------------------------------------
+# Uses SpatialDecon proportions (reordered_props_major) weighted by EcoTyper
+# state abundances to assign dominant cell states per AOI
+
+ecotyper_dir <- "output/EcoTyper_PanNeg/TPM_PanNeg/"
+
+celltypes <- c("B.cells","Dendritic.cells","Endothelial.cells",
+               "Fibroblasts","Monocytes.and.Macrophages","PCs")
+
+celltype_map <- list(
+  B.cells                   = "B-cells",
+  Dendritic.cells           = "Myeloid",
+  Endothelial.cells         = "Endothelial",
+  Fibroblasts               = "Fibroblast/Mesenchymal",
+  Monocytes.and.Macrophages = "Myeloid",
+  PCs                       = "Plasmablasts"
+)
+
+abundance <- lapply(setNames(celltypes, celltypes), function(cell) {
+  data.frame(t(read.delim(file.path(ecotyper_dir, cell, "state_abundances.txt"))))
+})
+
+check_exceed_and_append <- function(row, threshold) {
+  max_col <- names(row)[which.max(row)]
+  if (max(row) > threshold) max_col else NA_character_
+}
+
+meta_id <- pData(TNBC_downstream_PanNeg) %>%
+  select(ROI_REL) %>%
+  mutate(ID = gsub("-", ".", rownames(.)))
+
+group_df <- data.frame(
+  ID     = meta_id$ID,
+  Group  = TNBC_downstream_PanNeg$ConsensusCluster,
+  Region = TNBC_downstream_PanNeg$Region
+)
+
+align_matrix_ids <- function(prop_matrix, meta_id) {
+  mat <- as.data.frame(t(prop_matrix)) %>% rownames_to_column("ROI_REL")
+  mat$ROI_REL_prefix <- sub("^(.*?\\..*?)\\..*", "\\1", mat$ROI_REL)
+  meta_prefix <- meta_id %>%
+    mutate(ROI_REL_prefix = sub("^(.*?\\..*?)\\..*", "\\1", ROI_REL))
+  mat <- merge(mat, meta_prefix, by = "ROI_REL_prefix") %>%
+    select(-ROI_REL.x, -ROI_REL_prefix, -ROI_REL.y) %>%
+    column_to_rownames("ID")
+  as.data.frame(t(mat))
+}
+
+props_major_aligned <- align_matrix_ids(reordered_props_major, meta_id)
+
+assign_cell_states <- function(cell, threshold_q = 0.8) {
+  prop_col  <- celltype_map[[cell]]
+  abund_mat <- abundance[[cell]]
+  prop_mat  <- props_major_aligned[, rownames(abund_mat)]
+  prop_vals <- as.data.frame(t(prop_mat))[[prop_col]]
+  weighted  <- apply(t(as.data.frame(abund_mat)), 1, function(row) row * prop_vals)
+  val       <- quantile(reshape2::melt(weighted)$value, threshold_q)
+  apply(as.data.frame(weighted), 1, check_exceed_and_append, threshold = as.numeric(val)) %>%
+    as.data.frame() %>% setNames("State") %>%
+    filter(!is.na(State)) %>%
+    mutate(cellType = cell, ID = rownames(.)) %>%
+    merge(group_df, by = "ID")
+}
+
+assignment2 <- lapply(setNames(celltypes, celltypes), assign_cell_states)
+
+
+#### Add EcoTyper state labels -----------------------------------------------
+
+state_labels <- read_xlsx("data/Ecotyper_cell_state_reference.xlsx", sheet = "S4A") %>%
+  select(1:4) %>% drop_na() %>%
+  setNames(.[1, ]) %>% slice(-1) %>%
+  mutate(`Cell type` = recode(`Cell type`,
+                              "B cells"               = "B.cells",
+                              "Endothelial cells"     = "Endothelial.cells",
+                              "Dendritic cells"       = "Dendritic.cells",
+                              "Fibroblasts"           = "Fibroblasts",
+                              "Monocytes/Macrophages" = "Monocytes.and.Macrophages",
+                              "Plasma cells"          = "PCs"
+  )) %>% drop_na()
+
+assignment2_labeled <- lapply(celltypes, function(x) {
+  df <- merge(assignment2[[x]], state_labels[state_labels$`Cell type` == x, ],
+              by.x = "State", by.y = "Cell state", all.x = TRUE)
+  df$`Cell state annotation`[is.na(df$`Cell state annotation`)] <-
+    paste0("Unknown (", df$State[is.na(df$`Cell state annotation`)], ")")
+  df$`Cell state annotation` <- factor(df$`Cell state annotation`,
+                                       levels = unique(df$`Cell state annotation`[order(df$State)]))
+  df
+}) %>% setNames(celltypes)
+
+write.xlsx(assignment2_labeled, file = "output/TNBC_EcoTyper_states_major.xlsx", overwrite = TRUE)
+
+
+#### Plot cell state proportions by CC subtype and region --------------------
+
+state_palette <- c(S01 = "hotpink", S02 = "blue",   S03 = "forestgreen", S04 = "purple",
+                   S05 = "orange",  S06 = "yellow",  S07 = "brown",       S08 = "pink",
+                   S09 = "gray50")
+
+cell_titles <- c(
+  B.cells                   = "B cells",
+  Endothelial.cells         = "Endothelial",
+  Fibroblasts               = "Fibroblast/Mesenchymal",
+  Monocytes.and.Macrophages = "Myeloid",
+  Dendritic.cells           = "Dendritic cells",
+  PCs                       = "Plasma cells"
+)
+
+scaled_plots <- lapply(celltypes, function(cell) {
+  df <- assignment2_labeled[[cell]] %>%
+    filter(Region %in% c("C","E"), !is.na(Group)) %>%
+    mutate(Group = factor(Group, levels = c("CC1","CC2","CC3")))
+  ggplot(df, aes(x = Group, fill = State)) +
+    geom_bar(position = "fill", width = 0.5) +
+    scale_fill_manual(values = state_palette) +
+    facet_wrap(~Region) +
+    labs(title = cell_titles[[cell]], x = NULL, y = "Proportion", fill = "State") +
+    theme_minimal() +
+    theme(panel.grid   = element_blank(),
+          legend.title = element_text(face = "bold", size = 16),
+          legend.text  = element_text(size = 16),
+          axis.text.x  = element_text(face = "bold", size = 16, angle = 45, hjust = 1),
+          axis.text.y  = element_text(size = 14),
+          axis.title.y = element_text(size = 16, face = "bold"),
+          aspect.ratio = 1)
+}) %>% setNames(celltypes)
+
+pdf("output/EcoTyper_state_proportions_major_by_CC_Region.pdf", height = 9, width = 18)
+for (cell in celltypes) print(scaled_plots[[cell]])
+dev.off()
