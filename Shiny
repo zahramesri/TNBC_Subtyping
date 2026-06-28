@@ -1,1 +1,82 @@
+library(shiny)
+library(readxl)
+library(tidyverse)
+library(pheatmap)
 
+options(shiny.maxRequestSize = 80 * 1024^2)
+
+# Load reference data once at startup
+cell_markers <- as.data.frame(read_excel("data/Cell_type_Marker.xlsx", sheet = "AllSubtypeMarkers"))
+mean_train    <- read_excel("data/vsdMean_CC.xlsx") %>%
+  as.data.frame() %>%
+  column_to_rownames(var = "...1")
+
+model <- function(expr_mat) {
+  test_1 <- na.omit(expr_mat[match(cell_markers$gene, rownames(expr_mat)), ])
+  shared  <- intersect(rownames(test_1), rownames(mean_train))
+  
+  R <- as.data.frame(cor(test_1[shared, ], mean_train[shared, ], method = "pearson"))
+  R$maxind <- apply(R, 1, which.max)
+  R$class  <- c("CC1", "CC2", "CC3")[R$maxind]
+  R        <- rownames_to_column(R, var = "Patients")
+  
+  list(
+    assignments  = R[, c("Patients", "class")],
+    marker_expr  = test_1,
+    correlations = R
+  )
+}
+
+cc_colors <- c(CC1 = "#64A79A", CC2 = "#B7C7B8", CC3 = "#E0F2E6")
+
+ui <- fluidPage(
+  titlePanel("Cell type specific subtyping"),
+  sidebarLayout(
+    sidebarPanel(
+      tags$label(h3("Input File")),
+      fileInput("file1", "Choose xlsx file", accept = ".xlsx")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Table",   tableOutput("tabledata")),
+        tabPanel("Heatmap", plotOutput("themap"))
+      )
+    )
+  )
+)
+
+server <- function(input, output) {
+  results <- reactive({
+    req(input$file1)
+    
+    expr_mat <- read_excel(input$file1$datapath) %>%
+      as.data.frame() %>%
+      column_to_rownames(var = "...1")
+    
+    model(expr_mat)
+  })
+  
+  heatmap_plot <- reactive({
+    res      <- results()
+    col_anno <- data.frame(CC = res$assignments$class,
+                           row.names = res$assignments$Patients)
+    col_anno <- col_anno[order(col_anno$CC), , drop = FALSE]
+    
+    pheatmap(
+      as.matrix(res$marker_expr[, rownames(col_anno)]),
+      cluster_rows    = TRUE,
+      cluster_cols    = FALSE,
+      scale           = "row",
+      color           = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+      show_colnames   = FALSE,
+      show_rownames   = FALSE,
+      annotation_col  = col_anno,
+      annotation_colors = list(CC = cc_colors)
+    )
+  })
+  
+  output$tabledata <- renderTable(results()$assignments)
+  output$themap    <- renderPlot(heatmap_plot())
+}
+
+shinyApp(ui = ui, server = server)
