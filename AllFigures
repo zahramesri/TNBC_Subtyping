@@ -5,7 +5,6 @@ library(ggrepel)
 library(ggpubr)
 library(openxlsx)
 library(readxl)
-library(dplyr)
 library(tidyr)
 library(stringr)
 library(ggplot2)
@@ -198,8 +197,6 @@ dev.off()
 
 #### Cell deconvolution — EPIC -----------------------------------------------
 # EPIC and xCell run per package defaults; no custom code
-
-library(ggpubr)
 
 cell_types <- c("Bcells","CD4_Tcells","CD8_Tcells","CAFs",
                 "Endothelial","Macrophages","NKcells","otherCells")
