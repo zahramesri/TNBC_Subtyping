@@ -1,0 +1,139 @@
+library(GeomxTools)
+library(parallel)
+
+load("data/05_TNBC_downstream_GF5.RData")  # TNBC_downstream
+
+#### LMM helper functions ####
+
+format_lmm_results <- function(results2, subset) {
+  results2$Color <- "NS"
+  results2$Color[results2$`Pr(>|t|)` < 0.05]  <- "P < 0.05"
+  results2$Color[results2$FDR < 0.05]          <- "FDR < 0.05"
+  results2$Color[results2$FDR < 0.001]         <- "FDR < 0.001"
+  results2$Color <- factor(results2$Color,
+                           levels = c("NS", "P < 0.05", "FDR < 0.05", "FDR < 0.001"))
+  
+  results2$invert_P <- (-log10(results2$`Pr(>|t|)`)) * sign(results2$Estimate)
+  top_g <- c()
+  for (cond in subset) {
+    ind   <- results2$Subset == cond
+    top_g <- c(top_g,
+               results2[ind, "Gene"][order(results2[ind, "invert_P"], decreasing = TRUE)[1:15]],
+               results2[ind, "Gene"][order(results2[ind, "invert_P"], decreasing = FALSE)[1:15]])
+  }
+  results2$invert_P <- NULL
+  
+  list(results = results2, top_g = unique(top_g))
+}
+
+# Within-slide comparison (random slope for testClass)
+runLMM_within <- function(subset, categoryName, targetData,
+                          interceptNum, interceptDenom, testClass) {
+  results2 <- NULL
+  for (rely in subset) {
+    ind  <- pData(targetData)[, categoryName] == rely
+    newD <- targetData[, ind]
+    pData(newD)$testClass         <- factor(pData(newD)[[testClass]])
+    pData(newD)[["interceptNum"]] <- factor(pData(newD)[[interceptNum]])
+    pData(newD)[["interceptDenom"]] <- factor(pData(newD)[[interceptDenom]])
+    
+    mixedOutmc <- mixedModelDE(newD,
+                               elt          = "log_q",
+                               modelFormula = ~ testClass + (1 + testClass | interceptNum/interceptDenom),
+                               groupVar     = "testClass",
+                               nCores       = parallel::detectCores(),
+                               multiCore    = TRUE)
+    
+    r_test          <- as.data.frame(do.call(rbind, mixedOutmc["lsmeans", ]))
+    r_test$Contrast <- rownames(r_test)
+    r_test$Gene     <- unlist(lapply(colnames(mixedOutmc), rep, nrow(mixedOutmc["lsmeans", ][[1]])))
+    r_test$Subset   <- rely
+    r_test$FDR      <- p.adjust(r_test$`Pr(>|t|)`, method = "fdr")
+    r_test          <- r_test[, c("Gene", "Subset", "Contrast", "Estimate", "Pr(>|t|)", "FDR")]
+    results2        <- rbind(results2, r_test)
+  }
+  format_lmm_results(results2, subset)
+}
+
+# Across-slide comparison (random intercept only)
+runLMM_across <- function(subset, subsetName, targetData,
+                          interceptNum, interceptDenom, testClass) {
+  results2 <- NULL
+  for (rely in subset) {
+    ind  <- pData(targetData)[, subsetName] == rely
+    newD <- targetData[, ind]
+    pData(newD)$testClass           <- factor(pData(newD)[[testClass]])
+    pData(newD)[["interceptNum"]]   <- factor(pData(newD)[[interceptNum]])
+    pData(newD)[["interceptDenom"]] <- factor(pData(newD)[[interceptDenom]])
+    
+    mixedOutmc <- mixedModelDE(newD,
+                               elt          = "log_q",
+                               modelFormula = ~ testClass + (1 | interceptNum/interceptDenom),
+                               groupVar     = "testClass",
+                               nCores       = parallel::detectCores(),
+                               multiCore    = FALSE)
+    
+    r_test          <- as.data.frame(do.call(rbind, mixedOutmc["lsmeans", ]))
+    r_test$Contrast <- rownames(r_test)
+    r_test$Gene     <- unlist(lapply(colnames(mixedOutmc), rep, nrow(mixedOutmc["lsmeans", ][[1]])))
+    r_test$Subset   <- rely
+    r_test$FDR      <- p.adjust(r_test$`Pr(>|t|)`, method = "fdr")
+    r_test          <- r_test[, c("Gene", "Subset", "Contrast", "Estimate", "Pr(>|t|)", "FDR")]
+    results2        <- rbind(results2, r_test)
+  }
+  format_lmm_results(results2, subset)
+}
+
+#### Common parameters ####
+
+regions      <- c("E", "C", "F")
+subsetName   <- "Region"
+interceptNum <- "Patients"
+interceptDenom <- "slide name"
+
+#### 00: PanCK+ vs PanCK- within region ####
+
+results.00_PanPos_PanNeg <- runLMM_within(
+  subset       = regions,
+  categoryName = subsetName,
+  targetData   = TNBC_downstream,
+  interceptNum = interceptNum, interceptDenom = interceptDenom,
+  testClass    = "segment"
+)
+save(results.00_PanPos_PanNeg, file = "results/00_PanPosPanNeg.RData")
+
+#### Split by segment ####
+
+TNBC_downstream_PanNeg_I <- TNBC_downstream_PanNeg[, rownames(pData(TNBC_downstream_PanNeg) %>% filter(I_NI == "I"))]
+TNBC_downstream_PanPos_I <- TNBC_downstream_PanPos[, rownames(pData(TNBC_downstream_PanPos) %>% filter(I_NI == "I"))]
+
+#### 01-02: CC-specific DEA by region ####
+
+results.01_PanNeg_I <- runLMM_across(regions, subsetName, TNBC_downstream_PanNeg_I, interceptNum, interceptDenom, "ConsensusCluster")
+results.01_PanPos_I <- runLMM_across(regions, subsetName, TNBC_downstream_PanPos_I, interceptNum, interceptDenom, "ConsensusCluster")
+
+results.02_CC1_PanNeg_I <- runLMM_across(regions, subsetName, TNBC_downstream_PanNeg_I, interceptNum, interceptDenom, "DEA_CC1")
+results.02_CC1_PanPos_I <- runLMM_across(regions, subsetName, TNBC_downstream_PanPos_I, interceptNum, interceptDenom, "DEA_CC1")
+
+results.02_CC2_PanNeg_I <- runLMM_across(regions, subsetName, TNBC_downstream_PanNeg_I, interceptNum, interceptDenom, "DEA_CC2")
+results.02_CC2_PanPos_I <- runLMM_across(regions, subsetName, TNBC_downstream_PanPos_I, interceptNum, interceptDenom, "DEA_CC2")
+
+results.02_CC3_PanNeg_I <- runLMM_across(regions, subsetName, TNBC_downstream_PanNeg_I, interceptNum, interceptDenom, "DEA_CC3")
+results.02_CC3_PanPos_I <- runLMM_across(regions, subsetName, TNBC_downstream_PanPos_I, interceptNum, interceptDenom, "DEA_CC3")
+
+#### 03–04: Non-invasive  ####
+
+TNBC_downstream_PanNeg_NI <- TNBC_downstream_PanNeg[, rownames(pData(TNBC_downstream_PanNeg) %>% filter(I_NI == "NI"))]
+TNBC_downstream_PanPos_NI <- TNBC_downstream_PanPos[, rownames(pData(TNBC_downstream_PanPos) %>% filter(I_NI == "NI"))]
+
+results.03_PanNeg_NI <- runLMM_across("F", subsetName, TNBC_downstream_PanNeg_NI, interceptNum, interceptDenom, "ConsensusCluster")
+results.03_PanPos_NI <- runLMM_across("F", subsetName, TNBC_downstream_PanPos_NI, interceptNum, interceptDenom, "ConsensusCluster")
+
+results.04_CC1_PanNeg_NI <- runLMM_across("F", subsetName, TNBC_downstream_PanNeg_NI, interceptNum, interceptDenom, "DEA_CC1")
+results.04_CC1_PanPos_NI <- runLMM_across("F", subsetName, TNBC_downstream_PanPos_NI, interceptNum, interceptDenom, "DEA_CC1")
+
+results.04_CC2_PanNeg_NI <- runLMM_across("F", subsetName, TNBC_downstream_PanNeg_NI, interceptNum, interceptDenom, "DEA_CC2")
+results.04_CC2_PanPos_NI <- runLMM_across("F", subsetName, TNBC_downstream_PanPos_NI, interceptNum, interceptDenom, "DEA_CC2")
+
+results.04_CC3_PanNeg_NI <- runLMM_across("F", subsetName, TNBC_downstream_PanNeg_NI, interceptNum, interceptDenom, "DEA_CC3")
+results.04_CC3_PanPos_NI <- runLMM_across("F", subsetName, TNBC_downstream_PanPos_NI, interceptNum, interceptDenom, "DEA_CC3")
