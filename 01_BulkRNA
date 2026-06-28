@@ -13,6 +13,8 @@ library(ConsensusClusterPlus)
 library(pheatmap)
 library(grid)
 library(openxlsx)
+library(msigdbr)
+library(fgsea)
 
 #### Load data ---------------------------------------------------------------
 
@@ -46,7 +48,6 @@ id_map <- c(
   TNBC0933 = "TNBC0933_NEW", TNBC0793 = "TNBC0793_NEW"
 )
 counts <- rename(counts, any_of(id_map))
-
 
 #### DEA ---------------------------------------------------------------------
 
@@ -109,3 +110,71 @@ names(biomarkers) <- cc_names
 sink("output/Biomarkers_top20percentile_perCC.txt")
 print(biomarkers)
 sink()
+
+
+#### DEA: subtype-specific ####
+#Note coldata = metadata
+coldata <- coldata %>%
+  mutate(
+    DEA_CC1 = if_else(CC == "CC1", "CC1", "other"),
+    DEA_CC2 = if_else(CC == "CC2", "CC2", "other"),
+    DEA_CC3 = if_else(CC == "CC3", "CC3", "other")
+  )
+
+DEGs_sig <- function(dds_obj, contrast_name) {
+  df <- as.data.frame(results(dds_obj))
+  df$Gene      <- rownames(df)
+  df$Direction <- ifelse(df$log2FoldChange > 0, "upregulated", "downregulated")
+  df$Contrast  <- contrast_name
+  df
+}
+
+run_deseq <- function(cts, coldata, design_var) {
+  dds <- DESeqDataSetFromMatrix(countData = cts, colData = coldata,
+                                design = as.formula(paste("~", design_var)))
+  dds <- dds[rowSums(fpm(dds, robust = TRUE) > 1) >= 2]
+  DESeq(dds)
+}
+
+dds_CC1 <- run_deseq(cts, coldata, "DEA_CC1")
+dds_CC2 <- run_deseq(cts, coldata, "DEA_CC2")
+dds_CC3 <- run_deseq(cts, coldata, "DEA_CC3")
+
+All_DEGs <- bind_rows(
+  DEGs_sig(dds_CC1, "CC1"),
+  DEGs_sig(dds_CC2, "CC2"),
+  DEGs_sig(dds_CC3, "CC3")
+)
+
+All_DEGs_sig <- All_DEGs %>% filter(padj <= 0.05)
+
+write.xlsx(
+  list(All_DEGs = All_DEGs, All_DEGs_sig = All_DEGs_sig),
+  "results/BULK_DEGs.xlsx"
+)
+
+#### fGSEA ####
+
+msigdb_h  <- msigdbr(species = "Homo sapiens", category = "H")
+gene_sets <- split(msigdb_h$gene_symbol, msigdb_h$gs_name)
+
+fgsea_results <- lapply(unique(All_DEGs$Contrast), function(cc) {
+  df <- All_DEGs %>%
+    filter(Contrast == cc, !is.na(padj)) %>%
+    mutate(rank_score = sign(log2FoldChange) * -log10(padj)) %>%
+    distinct(Gene, .keep_all = TRUE)
+  
+  if (nrow(df) < 30) return(NULL)
+  
+  ranks        <- setNames(df$rank_score, df$Gene)
+  res          <- fgsea(pathways = gene_sets, stats = ranks, minSize = 15, maxSize = 500)
+  res$Contrast <- cc
+  res
+})
+
+fgsea_H <- bind_rows(fgsea_results) %>%
+  arrange(Contrast, padj, desc(NES))
+
+fgsea_sig <- fgsea_H %>% filter(padj < 0.05)
+
+write.xlsx(list(fgsea_H = fgsea_H), "results/BULK_CC_fGSEA.xlsx")
