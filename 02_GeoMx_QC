@@ -62,7 +62,27 @@ geomx_meta$Patients[geomx_meta$Patients %in% ER_patients] <-
 geomx_meta <- merge(geomx_meta, lsu_meta, by = "Patients", all.x = TRUE) %>%
   column_to_rownames(var = "DCC")
 
+geomx_meta <- geomx_meta[
+  colnames(assayData(TNBC_data)[["exprs"]]),
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    rownames(geomx_meta),
+    colnames(assayData(TNBC_data)[["exprs"]])
+  )
+)
+
 pData(TNBC_data) <- geomx_meta
+
+stopifnot(
+  identical(
+    sampleNames(TNBC_data),
+    colnames(assayData(TNBC_data)[["exprs"]])
+  )
+)
 
 
 #### ROI filtering -----------------------------------------------------------
@@ -373,6 +393,12 @@ norm_meta <- merge(norm_meta,
                    by = "Patients", all.x = TRUE)
 norm_meta$Repeated[is.na(norm_meta$Repeated)] <- "NO"
 norm_meta <- column_to_rownames(norm_meta, var = "DCC")
+
+norm_meta <- norm_meta[
+  colnames(assayData(TNBC_downstream)[["exprs"]]),
+  ,
+  drop = FALSE
+]
 
 norm_meta$DEA_CC1 <- ifelse(norm_meta$ConsensusCluster == "CC1", "CC1", "CC")
 norm_meta$DEA_CC2 <- ifelse(norm_meta$ConsensusCluster == "CC2", "CC2", "CC")
